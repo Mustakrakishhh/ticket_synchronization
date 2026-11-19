@@ -1,0 +1,47 @@
+{
+  "name": "local/travel-sync-bitrix24",
+  "description": "Multi-tenant Bitrix24 application for travel provider synchronization",
+  "type": "project",
+  "license": "proprietary",
+  "require": {
+    "php": "^8.2",
+    "ext-dom": "*",
+    "ext-json": "*",
+    "ext-openssl": "*",
+    "ext-pdo": "*",
+    "bitrix24/b24phpsdk": "^1.0",
+    "symfony/dotenv": "^7.2",
+    "symfony/event-dispatcher": "^7.2",
+    "symfony/http-client": "^7.2"
+  },
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  },
+  "scripts": {
+    "check": [
+      "@php tests/migrations.php",
+      "@php tests/diagnostics.php",
+      "@php tests/contracts.php",
+      "@php tests/smoke.php",
+      "@php tests/providers.php",
+      "@php tests/trivio-read-only.php",
+      "@php tests/additional-services.php",
+      "@php tests/sync.php",
+      "@php tests/expenses.php",
+      "@php tests/notifications.php",
+      "@php tests/bitrix-client.php",
+      "@php tests/oauth.php"
+    ]
+  },
+  "config": {
+    "sort-packages": true,
+    "platform": {
+      "php": "8.2.30"
+    },
+    "allow-plugins": {
+      "php-http/discovery": true
+    }
+  }
+}

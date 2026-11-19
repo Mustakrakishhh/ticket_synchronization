@@ -1,0 +1,697 @@
+openapi: 3.1.0
+info:
+  title: Bitrix24 PHP Application Base
+  version: 1.1.0
+  summary: Переносимый контракт базовой авторизации локального приложения Bitrix24
+  description: |
+    Этот файл описывает базовый каркас PHP-приложения Bitrix24 до предметной логики:
+    установку во фрейме Bitrix24, прием OAuth-контекста, изоляцию порталов по member_id,
+    хранение и автоматическое обновление токенов, серверную сессию, CSRF и удаление данных.
+
+    OpenAPI описывает HTTP-контракт. Алгоритмы, которые не выражаются стандартными полями
+    OpenAPI, зафиксированы в расширениях x-bitrix24-* и x-vibecoding-contract.
+
+    Основа соответствует реализации Travel Sync на PHP 8.2+, bitrix24/b24phpsdk,
+    Symfony HttpClient, PDO и AES-256-GCM. Секреты и реальные токены в файл не включаются.
+  contact:
+    name: Замените контактами проекта
+
+servers:
+  - url: https://your-app.example.com
+    description: Публичный HTTPS URL приложения
+
+tags:
+  - name: Installation
+    description: Установка и получение первичного OAuth-контекста
+  - name: Application
+    description: Открытие интерфейса и создание серверной сессии
+  - name: Session API
+    description: Защищенный backend API приложения
+  - name: Lifecycle events
+    description: События жизненного цикла приложения Bitrix24
+  - name: Bitrix24 OAuth server
+    description: Внешний сервер обновления OAuth-токенов Bitrix24
+
+paths:
+  /install.php:
+    get:
+      tags: [Installation]
+      summary: Открыть установщик во фрейме Bitrix24
+      description: |
+        Если OAuth-поля отсутствуют, страница подключает BX24.js, выполняет BX24.init(),
+        затем BX24.refreshAuth() и отправляет полученный контекст POST-запросом на этот же URL.
+      responses:
+        '200':
+          description: HTML установщика
+          content:
+            text/html:
+              schema:
+                type: string
+    post:
+      tags: [Installation]
+      summary: Сохранить OAuth-контекст установки
+      description: |
+        Принимает плоский placement-контекст или объект auth от Bitrix24. Backend нормализует
+        названия параметров, проверяет токен методами app.info и method.get,
+        сохраняет портал по member_id,
+        привязывает ONAPPUNINSTALL, выпускает cookie-сессию и только после успеха вызывает
+        BX24.installFinish() из браузера.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PlacementAuthContext'
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/PlacementAuthContext'
+                - type: object
+                  required: [auth]
+                  properties:
+                    auth:
+                      $ref: '#/components/schemas/BitrixAuthObject'
+      responses:
+        '200':
+          description: HTML с результатом установки и вызовом BX24.installFinish()
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SessionCookie'
+          content:
+            text/html:
+              schema:
+                type: string
+        '500':
+          $ref: '#/components/responses/HtmlAuthorizationError'
+      x-bitrix24-flow:
+        - Нормализовать AUTH_ID/access_token, REFRESH_ID/refresh_token, DOMAIN/domain и member_id.
+        - Отклонить запрос без access token, refresh token, domain или member_id.
+        - Рассчитать абсолютный expires; AUTH_EXPIRES может быть TTL, Unix timestamp или timestamp в миллисекундах.
+        - Проверить HTTPS client_endpoint и его совпадение с DOMAIN; в Marketplace разрешить канонический облачный домен Bitrix24.
+        - Вызвать app.info и user.current до сохранения; ошибка означает незавершенную установку.
+        - Проверить через method.get фактическую доступность обязательных методов, не доверяя только настроенному scope.
+        - Сохранять проверенный placement-токен при каждом открытии приложения, чтобы заменить действующий, но ограниченный токен.
+        - Разрешить установку администратору и только затем зашифровать OAuth payload по ключу member_id.
+        - Привязать ONAPPUPDATE и ONAPPUNINSTALL к APP_PUBLIC_URL/events.php; ошибка привязки останавливает установку.
+        - Выпустить подписанную HttpOnly cookie-сессию с member_id, ID администратора и признаком роли.
+        - В браузере вызвать BX24.installFinish() ровно один раз после успешных серверных действий.
+
+  /index.php:
+    get:
+      tags: [Application]
+      summary: Открыть приложение по действующей cookie-сессии
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: HTML приложения или экран повторной авторизации
+          content:
+            text/html:
+              schema:
+                type: string
+    post:
+      tags: [Application]
+      summary: Открыть приложение из placement-контекста Bitrix24
+      description: |
+        Placement-контекст проверяет member_id, домен и текущего администратора, но не заменяет
+        фоновую OAuth-пару при каждом открытии. Токен администратора сохраняется только при
+        подтвержденной недействительности ранее сохраненной пары.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PlacementAuthContext'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlacementAuthContext'
+      responses:
+        '200':
+          description: HTML приложения
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SessionCookie'
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api.php:
+    get:
+      tags: [Session API]
+      summary: Пример защищенного GET-запроса приложения
+      description: |
+        Все прикладные GET-операции сначала проверяют подпись, срок cookie и наличие member_id.
+        Параметр action расширяется предметными методами нового приложения.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: action
+          in: query
+          required: true
+          schema:
+            type: string
+            examples: [bootstrap]
+      responses:
+        '200':
+          description: Успешный JSON-ответ прикладного метода
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiSuccess'
+        '401':
+          $ref: '#/components/responses/JsonAuthorizationError'
+    post:
+      tags: [Session API]
+      summary: Пример защищенной изменяющей операции
+      description: |
+        Для POST/PUT/PATCH/DELETE обязательны одновременно cookie-сессия и X-CSRF-Token.
+        CSRF берется из серверной сессии и передается frontend-коду при рендеринге index.php.
+      security:
+        - sessionCookie: []
+          csrfToken: []
+      parameters:
+        - name: action
+          in: query
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Успешный JSON-ответ прикладного метода
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiSuccess'
+        '401':
+          $ref: '#/components/responses/JsonAuthorizationError'
+        '422':
+          $ref: '#/components/responses/JsonValidationError'
+
+  /events.php:
+    post:
+      tags: [Lifecycle events]
+      summary: Обработать ONAPPUNINSTALL
+      description: |
+        Удаление данных разрешается только при event=ONAPPUNINSTALL и совпадении
+        application_token с хешем, сохраненным для указанного member_id.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/UninstallEvent'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UninstallEvent'
+      responses:
+        '200':
+          description: Все данные tenant удалены транзакционно
+          content:
+            text/plain:
+              schema:
+                type: string
+                const: ok
+        '403':
+          description: Неверное событие, member_id или application_token
+          content:
+            text/plain:
+              schema:
+                type: string
+                const: forbidden
+
+  /oauth/token/:
+    servers:
+      - url: https://oauth.bitrix24.tech
+        description: Настраиваемый BITRIX24_OAUTH_SERVER
+    get:
+      tags: [Bitrix24 OAuth server]
+      summary: Обменять refresh token на новую пару токенов
+      description: |
+        Это внешний endpoint Bitrix24, а не endpoint приложения. Он вызывается backend-ом,
+        после истечения access_token или ответа expired_token. Возвращенный refresh_token
+        обязательно заменяет старый: Bitrix24 ротирует пару токенов.
+      parameters:
+        - name: grant_type
+          in: query
+          required: true
+          schema:
+            type: string
+            const: refresh_token
+        - name: client_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: client_secret
+          in: query
+          required: true
+          schema:
+            type: string
+            writeOnly: true
+        - name: refresh_token
+          in: query
+          required: true
+          schema:
+            type: string
+            writeOnly: true
+      responses:
+        '200':
+          description: Новая OAuth-пара
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthTokenResponse'
+        '400':
+          description: Refresh token недействителен или запрос некорректен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BitrixOAuthError'
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: b24_travel_sync_session
+      description: Подписанная HMAC-SHA256 серверная сессия; имя рекомендуется вынести в конфигурацию нового проекта.
+    csrfToken:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+
+  headers:
+    SessionCookie:
+      description: HttpOnly cookie со сроком 2 часа
+      schema:
+        type: string
+        example: b24_travel_sync_session=payload.signature; Path=/; Secure; HttpOnly; SameSite=None
+
+  schemas:
+    PlacementAuthContext:
+      type: object
+      required: [AUTH_ID, REFRESH_ID, DOMAIN, member_id]
+      properties:
+        AUTH_ID:
+          type: string
+          writeOnly: true
+          description: Текущий access token Bitrix24
+        REFRESH_ID:
+          type: string
+          writeOnly: true
+          description: Текущий refresh token Bitrix24
+        AUTH_EXPIRES:
+          oneOf:
+            - type: integer
+            - type: string
+          description: TTL или абсолютное время истечения access token
+          examples: [3600]
+        DOMAIN:
+          type: string
+          description: Домен портала без протокола
+          examples: [example.bitrix24.ru]
+        member_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Стабильный tenant key; все данные приложения изолируются по нему
+        application_token:
+          type: string
+          writeOnly: true
+          description: Секрет подписи событий Bitrix24; хранится только как password_hash
+        scope:
+          type: string
+          description: Фактический scope, если Bitrix24 передал его в placement-контексте
+        OAUTH_RETRY:
+          type: string
+          enum: ['1']
+          description: Внутренний флаг, не позволяющий бесконечно повторять browser refresh
+
+    BitrixAuthObject:
+      type: object
+      required: [access_token, refresh_token, domain, member_id]
+      properties:
+        access_token:
+          type: string
+          writeOnly: true
+        refresh_token:
+          type: string
+          writeOnly: true
+        expires:
+          type: integer
+        expires_in:
+          type: integer
+        domain:
+          type: string
+        member_id:
+          type: string
+        client_endpoint:
+          type: string
+          format: uri
+        server_endpoint:
+          type: string
+          format: uri
+        application_token:
+          type: string
+          writeOnly: true
+        scope:
+          type: string
+          description: Фактический список прав, выданный Bitrix24
+
+    OAuthTokenResponse:
+      allOf:
+        - $ref: '#/components/schemas/BitrixAuthObject'
+        - type: object
+          required: [access_token]
+          properties:
+            domain:
+              type: string
+              description: Домен OAuth-сервера, например oauth.bitrix24.tech; это не домен портала
+            client_endpoint:
+              type: string
+              format: uri
+              description: REST endpoint портала; его HTTPS-host определяет актуальный домен портала
+            status:
+              type: string
+              examples: [L]
+
+    StoredOAuthPayload:
+      type: object
+      description: До записи в БД весь объект шифруется AES-256-GCM
+      required:
+        - access_token
+        - refresh_token
+        - expires
+        - domain
+        - member_id
+        - client_endpoint
+        - server_endpoint
+        - scope
+      properties:
+        access_token:
+          type: string
+          writeOnly: true
+        refresh_token:
+          type: string
+          writeOnly: true
+        expires:
+          type: integer
+        expires_in:
+          type: integer
+        domain:
+          type: string
+        member_id:
+          type: string
+        client_endpoint:
+          type: string
+          format: uri
+        server_endpoint:
+          type: string
+          format: uri
+        scope:
+          type: string
+          examples: [crm,im,user_basic,userfieldconfig]
+        scope_source:
+          type: string
+          enum: [bitrix24, configuration]
+        token_fingerprint:
+          type: string
+          description: Первые 12 символов SHA-256 access token; сам токен не раскрывает
+        token_source:
+          type: string
+          enum: [placement, refresh, sdk_refresh]
+        capabilities:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              isExisting: { type: boolean }
+              isAvailable: { type: boolean }
+
+    TenantRow:
+      type: object
+      required: [member_id, domain, client_endpoint, oauth_payload, status, installed_at, updated_at]
+      properties:
+        member_id:
+          type: string
+        domain:
+          type: string
+        client_endpoint:
+          type: string
+          format: uri
+        oauth_payload:
+          type: string
+          description: base64(iv[12] + tag[16] + AES-256-GCM ciphertext)
+          writeOnly: true
+        application_token_hash:
+          type: [string, 'null']
+          writeOnly: true
+        status:
+          type: string
+          enum: [active, uninstalled]
+        installed_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    SessionPayload:
+      type: object
+      required: [member, uid, admin, csrf, exp]
+      properties:
+        member:
+          type: string
+          description: member_id текущего портала
+        uid:
+          type: integer
+          minimum: 1
+          description: Проверенный ID пользователя Bitrix24
+        admin:
+          type: boolean
+          description: Результат серверной проверки прав администратора Bitrix24
+        csrf:
+          type: string
+          minLength: 48
+        exp:
+          type: integer
+          description: Unix timestamp; стандартный срок сессии 7200 секунд
+
+    UninstallEvent:
+      type: object
+      required: [event, member_id, application_token]
+      properties:
+        event:
+          type: string
+          const: ONAPPUNINSTALL
+        member_id:
+          type: string
+        application_token:
+          type: string
+          writeOnly: true
+        auth:
+          type: object
+          properties:
+            member_id:
+              type: string
+            application_token:
+              type: string
+              writeOnly: true
+
+    ApiSuccess:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          description: Заменяется схемой конкретной предметной операции
+
+    ApiError:
+      type: object
+      required: [success, error]
+      properties:
+        success:
+          type: boolean
+          const: false
+        error:
+          type: object
+          required: [message, requestId]
+          properties:
+            message:
+              type: string
+            requestId:
+              type: string
+
+    BitrixOAuthError:
+      type: object
+      properties:
+        error:
+          type: string
+        error_description:
+          type: string
+
+  responses:
+    HtmlAuthorizationError:
+      description: Ошибка установки или авторизации
+      content:
+        text/html:
+          schema:
+            type: string
+    JsonAuthorizationError:
+      description: Cookie отсутствует, повреждена или истекла
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    JsonValidationError:
+      description: Некорректные параметры запроса или CSRF
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+x-bitrix24-environment:
+  required:
+    APP_PUBLIC_URL: Публичный HTTPS URL без завершающего слеша
+    APP_SESSION_SECRET: Не менее 32 случайных символов; используется только для HMAC cookie
+    APP_ENCRYPTION_KEY: base64 от 32 случайных байт; используется только для AES-256-GCM
+    BITRIX24_CLIENT_ID: Код локального или тиражного приложения
+    BITRIX24_CLIENT_SECRET: Секрет приложения; никогда не передается frontend-у
+    BITRIX24_SCOPE: crm,im,user_basic,userfieldconfig
+    BITRIX24_OAUTH_SERVER: https://oauth.bitrix24.tech/
+    DATABASE_DSN: sqlite:var/app.sqlite для теста; MySQL/PostgreSQL для production
+  optional:
+    APP_ENV: dev или prod
+    APP_DISTRIBUTION: local или marketplace
+
+x-bitrix24-token-refresh:
+  trigger: expires <= current_unix_time + 300
+  endpoint: '{BITRIX24_OAUTH_SERVER}/oauth/token/'
+  method: GET
+  query:
+    grant_type: refresh_token
+    client_id: BITRIX24_CLIENT_ID
+    client_secret: BITRIX24_CLIENT_SECRET
+    refresh_token: tenant.refresh_token
+  timeout_seconds: 15
+  max_duration_seconds: 30
+  attempts: 3
+  retry_statuses: [network_error, 404, 429, 500, 502, 503, 504]
+  retry_delay: 250ms * attempt
+  on_success:
+    - Проверить HTTP 200 и непустой access_token.
+    - Рассчитать expires из expires или expires_in.
+    - Обязательно сохранить новый refresh_token; при его отсутствии временно оставить старый.
+    - Проверить member_id, server_endpoint и фактический scope из ответа при наличии.
+    - Не записывать response.domain в домен портала: в refresh-ответе это домен OAuth-сервера.
+    - Проверить HTTPS client_endpoint из доверенного refresh-ответа, извлечь из него домен портала и сохранить канонический https://portal-domain/rest/.
+    - Записать безопасный SHA-256-отпечаток и источник токена без журналирования секретов.
+    - Зашифровать и сохранить всю новую запись до выполнения REST-запроса Bitrix24.
+  concurrency_guard:
+    - Если refresh завершился ошибкой, перечитать tenant из БД.
+    - Если другой процесс уже сохранил другой свежий refresh_token, использовать его запись.
+    - В production использовать MySQL, атомарный upsert и повторное чтение после гонки ротации refresh_token.
+  sdk_fallback:
+    - Подписаться на Bitrix24 SDK AuthTokenRenewedEvent.
+    - При автоматическом обновлении внутри SDK также немедленно перезаписать всю OAuth-пару.
+
+x-bitrix24-storage-security:
+  tenant_key: member_id
+  oauth_encryption:
+    algorithm: AES-256-GCM
+    key: APP_ENCRYPTION_KEY после строгого base64-декодирования в 32 байта
+    iv_bytes: 12
+    tag_bytes: 16
+    storage_format: base64(iv + tag + ciphertext)
+  application_token:
+    storage: password_hash
+    verification: password_verify
+  forbidden:
+    - Не хранить токены в public, JavaScript, Git, логах или незашифрованном JSON-файле.
+    - Не выбирать tenant по domain; использовать только member_id.
+    - Не делиться одной OAuth-парой между порталами.
+
+x-bitrix24-session-security:
+  cookie_payload: base64url(JSON SessionPayload)
+  signature: base64url(HMAC-SHA256(payload, APP_SESSION_SECRET))
+  ttl_seconds: 7200
+  cookie_flags:
+    HttpOnly: true
+    Secure: true в HTTPS
+    SameSite: None в HTTPS-фрейме Bitrix24, иначе Lax только для локальной разработки
+    Path: /
+  validation:
+    - Проверить наличие payload и signature.
+    - Сравнить HMAC через hash_equals.
+    - Декодировать JSON и проверить exp, непустой member, uid больше нуля и административную роль.
+    - Для изменяющих запросов сравнить X-CSRF-Token через hash_equals.
+
+x-vibecoding-contract:
+  objective: |
+    Сначала воспроизвести этот базовый OAuth-каркас и пройти acceptance checks. Только после этого
+    добавлять CRM, смарт-процессы, роботов, внешние API или другую предметную логику.
+  runtime:
+    php: '>=8.2'
+    packages:
+      - bitrix24/b24phpsdk:^1.0
+      - symfony/dotenv:^7.2
+      - symfony/event-dispatcher:^7.2
+      - symfony/http-client:^7.2
+    extensions: [json, openssl, pdo]
+  required_files:
+    public/install.php: Установка, BX24.refreshAuth, app.info, event.bind, BX24.installFinish
+    public/index.php: Прием placement-контекста или проверка cookie, передача CSRF frontend-у
+    public/api.php: SessionGuard для всех запросов, CSRF для всех изменяющих методов
+    public/events.php: Проверка ONAPPUNINSTALL и application_token, транзакционное удаление tenant
+    src/OAuth/InstallationRequest.php: Нормализация плоского и вложенного auth payload
+    src/OAuth/OAuthServiceFactory.php: Создание SDK, refresh по истечению, сохранение ротации токенов
+    src/Security/SessionGuard.php: HMAC cookie и CSRF
+    src/Crypto.php: AES-256-GCM
+    src/AppRepository.php: Tenant storage строго по member_id
+    src/Application.php: Единственная точка создания Bitrix24 клиента из сохраненного tenant
+  invariants:
+    - Ни один backend REST-вызов Bitrix24 не получает access token из браузерного body напрямую.
+    - Backend принимает member_id только из проверенной серверной сессии, кроме установки и подписанных событий.
+    - Каждый вызов Application.bitrix(member_id) обновляет истёкший токен; SDK повторяет сценарий после expired_token.
+    - После смены отпечатка токена worker проверяет crm.item.add, crm.item.update и im.notify.system.add через method.get.
+    - Новая OAuth-пара сохраняется целиком; нельзя обновить только access_token.
+    - OAuth response.domain никогда не заменяет домен портала; домен портала извлекается из client_endpoint.
+    - Ошибка refresh без действующей конкурентно обновленной записи требует переустановки приложения, а не подмены tenant.
+    - Предметные таблицы обязательно содержат member_id в ключе или индексе изоляции.
+  acceptance_checks:
+    - Чистая установка сохраняет tenant и app.info отрабатывает успешно.
+    - Установщик вызывает BX24.installFinish только после серверного успеха.
+    - Открытие приложения из Bitrix24 выпускает HttpOnly Secure SameSite=None cookie.
+    - Поврежденная или истекшая cookie отклоняется.
+    - POST без X-CSRF-Token и с неверным токеном отклоняется.
+    - Свежий access token не вызывает refresh.
+    - Истёкший токен обновляется до REST-вызова; expired_token также обрабатывается SDK.
+    - Временные 404, 429 и 5xx refresh повторяются ограниченно.
+    - Ротация refresh_token записывается в зашифрованный tenant payload.
+    - Проверка method.get различает существование и доступность обязательных методов текущему токену.
+    - Два параллельных refresh не заставляют рабочий tenant проходить браузерную авторизацию заново.
+    - ONAPPUNINSTALL с неверным application_token возвращает 403 и ничего не удаляет.
+    - ONAPPUNINSTALL с верным токеном удаляет только данные указанного member_id.
+  prompt_for_next_chat: |
+    Реализуй базовый PHP-каркас приложения Bitrix24 строго по этому OpenAPI-файлу.
+    Сначала создай конфигурацию, tenant storage, Crypto, InstallationRequest, OAuthServiceFactory,
+    SessionGuard, install.php, index.php, api.php и events.php. Добавь автоматические тесты всех
+    acceptance_checks. Не начинай предметную логику, пока OAuth refresh, tenant isolation, session,
+    CSRF, installFinish и ONAPPUNINSTALL не проверены. Не вставляй реальные секреты в код.
+
+x-bitrix24-official-references:
+  installation_callback: https://apidocs.bitrix24.ru/settings/app-installation/local-apps/installation-callback.html
+  installation_finish: https://apidocs.bitrix24.ru/settings/app-installation/installation-finish.html
+  refresh_auth_js: https://apidocs.bitrix24.ru/sdk/bx24-js-sdk/system-functions/bx24-refresh-auth.html
+  app_info: https://apidocs.bitrix24.ru/api-reference/common/system/app-info.html
+  uninstall_event: https://apidocs.bitrix24.ru/api-reference/common/events/on-app-uninstall.html

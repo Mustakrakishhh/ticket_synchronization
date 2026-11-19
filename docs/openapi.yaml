@@ -1,0 +1,257 @@
+openapi: 3.0.3
+info:
+  title: Bitrix24 Travel Sync Internal API
+  version: 0.8.0
+  description: >
+    Внутренний API мастера настройки. Доступен только внутри авторизованного
+    iframe Bitrix24. OAuth-токены и ключи провайдеров никогда не возвращаются.
+servers:
+  - url: https://travel-sync.example.com
+paths:
+  /api.php:
+    get:
+      summary: Чтение настроек и справочников
+      parameters:
+        - $ref: '#/components/parameters/ReadAction'
+        - name: entityTypeId
+          in: query
+          required: false
+          schema: { type: integer }
+        - name: provider
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/ProviderCode'
+        - name: categoryId
+          in: query
+          required: false
+          schema: { type: integer }
+        - name: refresh
+          in: query
+          required: false
+          description: >
+            Передайте 1, чтобы для справочников Bitrix24 не использовать свежий
+            серверный кэш и запросить актуальные данные портала. Если портал временно
+            недоступен, приложение может вернуть последнюю успешно сохранённую копию.
+          schema:
+            type: integer
+            enum: [0, 1]
+      responses:
+        '200':
+          description: Успешный ответ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      summary: Сохранение подключения, mapping или общих настроек
+      parameters:
+        - $ref: '#/components/parameters/WriteAction'
+        - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/SaveProvider'
+                - $ref: '#/components/schemas/SaveMappings'
+                - $ref: '#/components/schemas/SaveExpenseMappings'
+                - $ref: '#/components/schemas/SaveSettings'
+                - $ref: '#/components/schemas/ProviderAction'
+      responses:
+        '200':
+          description: Настройки сохранены
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '202':
+          description: Задача синхронизации поставлена в очередь
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Ошибка проверки данных
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Failure'
+components:
+  parameters:
+    ReadAction:
+      name: action
+      in: query
+      required: true
+      schema:
+        type: string
+        enum:
+          - bootstrap
+          - smart-processes
+          - smart-process-fields
+          - smart-process-categories
+          - smart-process-stages
+          - bitrix-users
+          - mappings.get
+          - expense-mappings.get
+          - settings.get
+          - sync.runs
+    WriteAction:
+      name: action
+      in: query
+      required: true
+      schema:
+        type: string
+        enum:
+          - providers.save
+          - providers.test
+          - mappings.save
+          - expense-mappings.save
+          - smart-process-fields.create
+          - expense-fields.create
+          - settings.save
+          - sync.run
+    Csrf:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      schema: { type: string }
+  responses:
+    Unauthorized:
+      description: Приложение необходимо открыть из Bitrix24
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Failure'
+  schemas:
+    ProviderCode:
+      type: string
+      enum: [aviasales, smartway, trivio]
+    SaveProvider:
+      type: object
+      required: [provider, credentials, enabled]
+      properties:
+        provider:
+          $ref: '#/components/schemas/ProviderCode'
+        enabled: { type: boolean }
+        credentials:
+          type: object
+          additionalProperties: { type: string }
+          description: Сохраняется только в зашифрованном виде.
+    Mapping:
+      type: object
+      required: [sourceField, targetField]
+      properties:
+        sourceField: { type: string }
+        targetField: { type: string }
+        transform:
+          type: string
+          enum: ['', string, string_multiple, date, money, boolean, file, file_multiple]
+          description: >-
+            string_multiple передаёт массив значений в множественную строку Bitrix24.
+            additional_service_types использует string_multiple;
+            additional_service_files использует file_multiple и отдельное множественное файловое поле.
+    SaveMappings:
+      type: object
+      required: [provider, mappings]
+      properties:
+        provider:
+          $ref: '#/components/schemas/ProviderCode'
+        mappings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Mapping'
+    SaveExpenseMappings:
+      type: object
+      required: [mappings]
+      properties:
+        mappings:
+          type: array
+          description: Единое сопоставление нормализованных полей затрат для всех провайдеров.
+          items:
+            $ref: '#/components/schemas/Mapping'
+    ProviderAction:
+      type: object
+      required: [provider]
+      properties:
+        provider:
+          $ref: '#/components/schemas/ProviderCode'
+    SaveSettings:
+      type: object
+      required: [settings]
+      properties:
+        settings:
+          $ref: '#/components/schemas/Settings'
+    Settings:
+      type: object
+      properties:
+        entityTypeId: { type: integer, nullable: true }
+        intervalMinutes:
+          type: integer
+          enum: [5, 10, 15, 30, 60, 180]
+        initialLookbackDays:
+          type: integer
+          enum: [1, 3, 7, 30]
+        titleTemplate: { type: string }
+        accommodationTitleTemplate: { type: string }
+        createItems: { type: boolean }
+        updateItems: { type: boolean }
+        preserveTitleOnUpdate:
+          type: boolean
+          description: Записывать название карточки только при создании и не менять его при последующих синхронизациях.
+        syncReturns: { type: boolean }
+        attachDocuments: { type: boolean }
+        enabled: { type: boolean }
+        notificationEnabled: { type: boolean }
+        notifyOnEmpty: { type: boolean }
+        notificationUserIds:
+          type: array
+          maxItems: 100
+          items: { type: integer, minimum: 1 }
+        serviceRoutes:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ServiceRoute'
+        expenseSync:
+          $ref: '#/components/schemas/ExpenseSettings'
+    ExpenseSettings:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        entityTypeId: { type: integer, nullable: true }
+        categoryId: { type: integer, nullable: true }
+        stageId: { type: string }
+        assignedById: { type: integer, nullable: true }
+        titleTemplate: { type: string }
+        accommodationTitleTemplate: { type: string }
+        createItems: { type: boolean }
+        updateItems: { type: boolean }
+        preserveTitleOnUpdate: { type: boolean }
+    ServiceRoute:
+      type: object
+      required: [enabled, categoryId, stageId]
+      properties:
+        enabled: { type: boolean }
+        categoryId: { type: integer, nullable: true }
+        stageId: { type: string }
+    Success:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data: {}
+    Failure:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, enum: [false] }
+        error:
+          type: object
+          required: [message]
+          properties:
+            message: { type: string }
